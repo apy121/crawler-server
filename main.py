@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,11 +7,12 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from chatgpt_client import ChatGPTClient
+from chatgpt_product_fetcher import ChatGPTProductFetcher  # New import
 import os
-from chatgpt_helper import ChatGPTHelper;
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # Load variables from .env file
 
 app = FastAPI()
 
@@ -26,15 +28,13 @@ class DomainsRequest(BaseModel):
     domains: list[str]
 
 # Constants
-PRODUCT_KEYWORDS = ["/product/", "/item/", "/p/", "/sku/", "product"]
-MAX_CONCURRENT_REQUESTS = 10  # Reduced for ChatGPT API limits
-MAX_DEPTH = 1  # Only follow category links from homepage
-MAX_PRODUCTS = 500  # Limit total products per domain
+MAX_CONCURRENT_REQUESTS = 10
+MAX_PRODUCTS = 500
 
-chatgpt = ChatGPTHelper()
+# Initialize ChatGPT clients
+chatgpt_client = ChatGPTClient(os.getenv("OPENAI_API_KEY"))
+chatgpt_fetcher = ChatGPTProductFetcher(os.getenv("OPENAI_API_KEY"))  # New fetcher
 
-async def is_product_url(url):
-    return any(keyword in url.lower() for keyword in PRODUCT_KEYWORDS)
 
 async def fetch_page(session, url, semaphore):
     async with semaphore:
@@ -46,80 +46,100 @@ async def fetch_page(session, url, semaphore):
             print(f"Failed to fetch {url}: {e}")
         return None
 
-def extract_product_links(soup, base_url):
-    """Extract product links from page HTML"""
-    product_links = set()
-    
-    # Common patterns
+def extract_all_links(soup, base_url):
+    """Extract all URLs from various HTML elements"""
+    links = set()
     for link in soup.find_all('a', href=True):
-        href = link['href'].lower()
-        if any(kw in href for kw in PRODUCT_KEYWORDS):
-            product_links.add(urljoin(base_url, link['href']))
-    
-    # Product cards
-    for card in soup.select('[class*="product"], [class*="item"], [class*="card"]'):
-        link = card.find('a', href=True)
-        if link and any(kw in link['href'].lower() for kw in PRODUCT_KEYWORDS):
-            product_links.add(urljoin(base_url, link['href']))
-    
-    return product_links
+        full_url = urljoin(base_url, link['href'])
+        links.add(full_url)
+    for link in soup.find_all('link', href=True):
+        full_url = urljoin(base_url, link['href'])
+        links.add(full_url)
+    for img in soup.find_all('img', src=True):
+        full_url = urljoin(base_url, img['src'])
+        links.add(full_url)
+    for script in soup.find_all('script', src=True):
+        total_url = urljoin(base_url, script['src'])
+        links.add(total_url)
+    for meta in soup.find_all('meta', attrs={'content': True}):
+        if 'http' in meta['content']:
+            full_url = urljoin(base_url, meta['content'])
+            links.add(full_url)
+    for form in soup.find_all('form', action=True):
+        full_url = urljoin(base_url, form['action'])
+        links.add(full_url)
+    return links
+
+def filter_domain_links(links, domain_prefix):
+    """Filter links to only include those with the domain prefix"""
+    return [url for url in links if url.startswith(domain_prefix)]
 
 async def crawl_domain(domain):
-    all_product_urls = set()
+    result = {domain: []}
     visited = set()
-    domain_base = urlparse(domain).netloc
+    domain_prefix = domain.rstrip('/') + '/'
     
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Step 1: Get homepage and identify categories with ChatGPT
         homepage_html = await fetch_page(session, domain, semaphore)
         if not homepage_html:
-            return []
+            return {domain: []}
             
-        category_urls = await chatgpt.get_category_links(homepage_html, domain)
-        category_urls = [url for url in category_urls if urlparse(url).netloc == domain_base][:10]  # Limit to 10 categories
+        with ThreadPoolExecutor() as executor:
+            loop = asyncio.get_event_loop()
+            soup = await loop.run_in_executor(executor, BeautifulSoup, homepage_html, 'html.parser')
+            first_layer_urls = await loop.run_in_executor(
+                executor, extract_all_links, soup, domain
+            )
         
-        # Step 2: Crawl each category page for products
-        tasks = []
-        for category_url in category_urls:
-            if category_url not in visited:
-                tasks.append(process_category_page(session, category_url, semaphore, domain_base))
+        second_layer_tasks = []
+        for url in first_layer_urls:
+            if url not in visited and urlparse(url).scheme in ('http', 'https'):
+                visited.add(url)
+                second_layer_tasks.append(fetch_page(session, url, semaphore))
+                
+        second_layer_htmls = await asyncio.gather(*second_layer_tasks)
         
-        results = await asyncio.gather(*tasks)
-        for product_urls in results:
-            all_product_urls.update(product_urls)
+        with ThreadPoolExecutor() as executor:
+            loop = asyncio.get_event_loop()
+            all_urls = []
+            for html in second_layer_htmls:
+                if html:
+                    soup = await loop.run_in_executor(executor, BeautifulSoup, html, 'html.parser')
+                    new_links = await loop.run_in_executor(
+                        executor, extract_all_links, soup, domain
+                    )
+                    filtered_urls = filter_domain_links(new_links, domain_prefix)
+                    all_urls.extend(filtered_urls)
+                    if len(all_urls) >= MAX_PRODUCTS * 2:
+                        break
             
-            if len(all_product_urls) >= MAX_PRODUCTS:
-                break
-    
-    return sorted(all_product_urls)[:MAX_PRODUCTS]
 
-async def process_category_page(session, url, semaphore, domain_base):
-    """Process a single category page to extract products"""
-    product_urls = set()
+            # Filter URLs through ChatGPT to get only product pages
+            product_urls = await chatgpt_client.filter_product_pages(all_urls)
+            result[domain] = sorted(product_urls)[:MAX_PRODUCTS]
+
+    # If no product URLs found, fetch from ChatGPT
+    if not result[domain]:
+        print(f"No product URLs found for {domain}, fetching from ChatGPT...")
+        chatgpt_urls = await chatgpt_fetcher.fetch_product_urls(domain, batch_size=50, total_urls=200)
+        result[domain] = sorted(chatgpt_urls)[:MAX_PRODUCTS]
+        print(f"ChatGPT provided URLs for {domain}: {result[domain]}")
     
-    html = await fetch_page(session, url, semaphore)
-    if not html:
-        return product_urls
-    
-    with ThreadPoolExecutor() as executor:
-        loop = asyncio.get_event_loop()
-        soup = await loop.run_in_executor(executor, BeautifulSoup, html, 'html.parser')
-        product_urls = await loop.run_in_executor(executor, extract_product_links, soup, url)
-    
-    return product_urls
+    return result
 
 @app.post("/crawl")
 async def get_product_urls(request: DomainsRequest):
     tasks = [crawl_domain(domain) for domain in request.domains]
     crawled_results = await asyncio.gather(*tasks)
     
-    return {
-        domain: urls 
-        for domain, urls in zip(request.domains, crawled_results)
-    }
+    final_result = {}
+    for domain, result in zip(request.domains, crawled_results):
+        final_result[domain] = result.get(domain, [])
+    
+    return final_result
 
 if __name__ == "__main__":
     import uvicorn
